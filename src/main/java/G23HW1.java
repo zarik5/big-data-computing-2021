@@ -85,9 +85,9 @@ public class G23HW1 {
 
         // =============================== STEP 4: Get top T ratings ===============================
         List<Tuple2<String, Float>> topRatings = maxNormRatings
-                // MAP -> (AscendingRank, (ProductID, MaxNormRating))
+                // MAP -> (AscendingRank, (ProductID, MNR))
                 .mapToPair(pair -> new Tuple2<>(-pair._2(), pair))
-                // REDUCE -> (AscendingRank, (ProductID, MaxNormRating))
+                // REDUCE -> (AscendingRank, (ProductID, MNR))
                 .sortByKey()
                 .take(T)
                 .stream()
