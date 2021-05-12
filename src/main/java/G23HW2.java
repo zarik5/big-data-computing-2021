@@ -29,16 +29,18 @@ public class G23HW2 {
             List<Tuple2<Vector, Integer>> clustering,
             Vector point,
             int cluster_idx,
-            Map<Integer, Integer> normalization_factors
+            Map<Integer, Long> normalization_factors
     ) {
         float a = (float) clustering
                 .stream()
+                .sequential()
                 .filter(pair -> pair._2 == cluster_idx)
                 .mapToDouble(pair -> Vectors.sqdist(point, pair._1))
                 .sum() / normalization_factors.get(cluster_idx);
 
         List<Tuple2<Double, Integer>> distances = clustering
                 .stream()
+                .sequential()
                 .filter(pair -> pair._2 != cluster_idx)
                 .map(pair -> new Tuple2<>(Vectors.sqdist(point, pair._1), pair._2))
                 .collect(Collectors.toList());
@@ -46,9 +48,13 @@ public class G23HW2 {
         for (Tuple2<Double, Integer> pair : distances) {
             sums.compute(pair._2, (__, sum) -> (sum != null ? sum : 0) + pair._1);
         }
-        float b = (float) sums.entrySet().stream().mapToDouble(entry ->
-                entry.getValue() / normalization_factors.get(entry.getKey())
-        ).min().orElse(0);
+        float b = (float) sums
+                .entrySet()
+                .stream()
+                .sequential()
+                .mapToDouble(entry -> entry.getValue() / normalization_factors.get(entry.getKey()))
+                .min()
+                .orElse(0);
 
         return (b - a) / Math.max(a, b);
     }
@@ -59,7 +65,8 @@ public class G23HW2 {
         }
 
         // Spark setup
-        JavaSparkContext context = new JavaSparkContext(new SparkConf(true).setAppName("G23HW2"));
+        JavaSparkContext context =
+                new JavaSparkContext(new SparkConf(true).setAppName("G23HW2"));
 
         // Input file path
         String filePath = args[0];
@@ -71,20 +78,18 @@ public class G23HW2 {
 
         // ============================== STEP 1: Read the input data ==============================
         final int PARTITIONS = 8;
-        JavaPairRDD<Vector, Integer> fullClustering = context
-                .textFile(filePath)
-                .repartition(PARTITIONS)
-                .mapToPair(G23HW2::strToTuple);
+        JavaPairRDD<Vector, Integer> fullClustering =
+                context.textFile(filePath).repartition(PARTITIONS).mapToPair(G23HW2::strToTuple);
 
         // ========================== STEP 2: Compute sharedClusterSizes ===========================
-        // A map is used instead of a list or array, to preserve the cluster index (in case there are skips in the
-        // indices)
+        // A map is used instead of a list or array, to preserve the cluster index (in case there
+        // are skips in the indices)
         Broadcast<Map<Integer, Long>> sharedClusterSizes =
                 context.broadcast(fullClustering.map(Tuple2::_2).countByValue());
 
         // ============================= STEP 3: Get clusteringSample ==============================
-        // Note: Especially in this step, storing the points as (cluster_idx, vector) would have been more ergonomic
-        // than (vector, cluster_idx), saving two "mapToPair()".
+        // Note: Especially in this step, storing the points as (cluster_idx, vector) would have
+        // been more ergonomic than (vector, cluster_idx), saving two "mapToPair()".
         Broadcast<List<Tuple2<Vector, Integer>>> clusteringSample = context.broadcast(
                 fullClustering
                         // Poisson sampling (P[x < min{t/|C|, 1}])
@@ -104,21 +109,14 @@ public class G23HW2 {
         // ============== STEP 4: Calculate approximate silhouette on fullClustering ===============
         long start_time_ms = System.currentTimeMillis();
 
-        // normalization_factors is computed sequentially because sharedClusterSizes is small enough.
-        Broadcast<Map<Integer, Integer>> normalization_factors = context.broadcast(
-                sharedClusterSizes
-                        .value()
-                        .entrySet()
-                        .stream()
-                        .map(entry -> new AbstractMap.SimpleEntry<>(
-                                entry.getKey(),
-                                (int) Math.min(t, entry.getValue()))
-                        )
-                        .collect(Collectors.toMap(
-                                AbstractMap.SimpleEntry::getKey,
-                                AbstractMap.SimpleEntry::getValue)
-                        )
-        );
+        // normalization_factors is computed sequentially because sharedClusterSizes is small
+        // enough.
+        Broadcast<Map<Integer, Long>> normalization_factors = context.broadcast(new HashMap<>());
+        for (Map.Entry<Integer, Long> entry : sharedClusterSizes.value().entrySet()) {
+            normalization_factors.value().compute(entry.getKey(),
+                    (__, sum) -> (sum != null ? sum : 0) + Math.min(t, entry.getValue())
+            );
+        }
 
         float approxSilhFull = fullClustering
                 .map(point -> G23HW2.clustering_silhouette_for_point(
@@ -134,7 +132,7 @@ public class G23HW2 {
         // ================ STEP 5: Calculate exact silhouette on clusteringSample =================
         start_time_ms = System.currentTimeMillis();
 
-        Map<Integer, Integer> cluster_sample_sizes = new HashMap<>();
+        Map<Integer, Long> cluster_sample_sizes = new HashMap<>();
         for (Tuple2<Vector, Integer> pair : clusteringSample.value()) {
             cluster_sample_sizes.compute(pair._2, (__, sum) -> (sum != null ? sum : 0) + 1);
         }
