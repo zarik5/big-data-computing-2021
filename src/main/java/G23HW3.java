@@ -10,10 +10,9 @@ import org.apache.spark.mllib.linalg.Vector;
 import org.apache.spark.mllib.linalg.Vectors;
 import scala.Tuple2;
 
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class G23HW3 {
 
@@ -23,14 +22,14 @@ public class G23HW3 {
             List<Tuple2<Vector, Integer>> clustering,
             Vector point,
             int cluster_idx,
-            Map<Integer, Long> normalization_factors
+            List<Broadcast<Long>> normalization_factors
     ) {
         float a = (float) clustering
                 .stream()
                 .sequential()
                 .filter(pair -> pair._2 == cluster_idx)
                 .mapToDouble(pair -> Vectors.sqdist(point, pair._1))
-                .sum() / normalization_factors.get(cluster_idx);
+                .sum() / normalization_factors.get(cluster_idx).value();
 
         List<Tuple2<Double, Integer>> distances = clustering
                 .stream()
@@ -46,7 +45,9 @@ public class G23HW3 {
                 .entrySet()
                 .stream()
                 .sequential()
-                .mapToDouble(entry -> entry.getValue() / normalization_factors.get(entry.getKey()))
+                .mapToDouble(entry -> 
+                        entry.getValue() / normalization_factors.get(entry.getKey()).value()
+                )
                 .min()
                 .orElse(0);
 
@@ -55,7 +56,7 @@ public class G23HW3 {
 
     public static void main(String[] args) throws IllegalArgumentException {
         if (args.length != 6) {
-            throw new IllegalArgumentException("USAGE: file_path num_clusters sample_size");
+            throw new IllegalArgumentException("USAGE: file_path kstart h iter M L");
         }
 
         // Spark setup
@@ -63,6 +64,7 @@ public class G23HW3 {
                 new JavaSparkContext(new SparkConf(true)
                         .setAppName("G23HW3")
                         .set("spark.locality.wait", "0s"));
+        context.setLogLevel("WARN");
 
         // Input file path
         String filePath = args[0];
@@ -78,16 +80,17 @@ public class G23HW3 {
         int L = Integer.parseInt(args[5]);
 
 
-        System.out.println("INPUT PARAMETERS: file=" + filePath + " kstart=" + kstart + " iter=" + iter + " M=" + M + " L=" + L + "\n");
+        System.out.println("INPUT PARAMETERS: file=" + filePath + " kstart=" + kstart + " h=" + h +
+                " iter=" + iter + " M=" + M + " L=" + L + "\n");
 
-        // ============================== STEP 1: Read the input data ==============================
+        // ================================== Read the input data ==================================
         long start_time_ms = System.currentTimeMillis();
 
         JavaRDD<Vector> inputPoints = context.textFile(filePath).repartition(L).map(s -> {
-            String[] sarry = s.split(" ");
-            double[] values = new double[sarry.length];
-            for (int i = 0; i < sarry.length; i++) {
-                values[i] = Double.parseDouble(sarry[i]);
+            String[] arr = s.split(" ");
+            double[] values = new double[arr.length];
+            for (int i = 0; i < arr.length; i++) {
+                values[i] = Double.parseDouble(arr[i]);
             }
             return Vectors.dense(values);
         }).cache();
@@ -96,38 +99,32 @@ public class G23HW3 {
 
         System.out.println("Time for input reading = " + input_time_ms);
 
-        for(int k = kstart; k < kstart + h; k++) {
-            //System.out.println("\n" + "Number of clusters k = " + k);
-
-            // Computes a clustering of the input points with k clusters
+        for (int k = kstart; k < kstart + h; k++) {
+            // ================================ Compute clustering =================================
             start_time_ms = System.currentTimeMillis();
 
-            KMeansModel clusters = KMeans.train(inputPoints.rdd(), k, iter);
+            KMeansModel centers = KMeans.train(inputPoints.rdd(), k, iter);
 
             // RDD currentClustering of pairs (point, cluster_index)
-            JavaPairRDD<Vector, Integer>currentClustering = inputPoints.repartition(L).mapToPair(data -> {
-                return new Tuple2<>(data, clusters.predict(data));
-            }).cache();
+            JavaPairRDD<Vector, Integer> currentClustering =
+                    inputPoints.mapToPair(point -> new Tuple2<>(point,
+                            centers.predict(point))).cache();
 
             long clustering_time_ms = System.currentTimeMillis() - start_time_ms;
 
-            // Use the code in HW2
-            Integer t = M / k;
-            // ==========================  Compute sharedClusterSizes ===========================
-            // A map is used instead of a list or array, to preserve the cluster index (in case there
-            // are skips in the indices)
+            // ================= Compute approximate average silhouette coefficient ================
+            start_time_ms = System.currentTimeMillis();
+            int t = M / k;
+
             Broadcast<Map<Integer, Long>> sharedClusterSizes =
                     context.broadcast(currentClustering.map(Tuple2::_2).countByValue());
 
-            start_time_ms = System.currentTimeMillis();
-            // ============================= Get clusteringSample ==============================
-            // Note: Especially in this step, storing the points as (cluster_idx, vector) would have
-            // been more ergonomic than (vector, cluster_idx), saving two "mapToPair()".
             Broadcast<List<Tuple2<Vector, Integer>>> clusteringSample = context.broadcast(
                     currentClustering
                             // Poisson sampling (P[x < min{t/|C|, 1}])
                             .filter(data -> Math.random() <
-                                    Math.min((float) t / sharedClusterSizes.value().get(data._2), 1))
+                                    Math.min((float) t / sharedClusterSizes.value().get(data._2), 1)
+                            )
                             .mapToPair(pair -> new Tuple2<>(pair._2, pair._1))
                             // Group by cluster
                             .groupByKey()
@@ -139,41 +136,46 @@ public class G23HW3 {
                             .collect()
             );
 
-
-
-            // ================ Calculate exact silhouette on clusteringSample =================
-
-            Map<Integer, Long> cluster_sample_sizes = new HashMap<>();
-            for (Tuple2<Vector, Integer> pair : clusteringSample.value()) {
-                cluster_sample_sizes.compute(pair._2, (__, sum) -> (sum != null ? sum : 0) + 1);
+            // normalization_factors is computed sequentially because sharedClusterSizes is small
+            // enough.
+            Map<Integer, Long> normalization_factors_temp = new HashMap<>();
+            for (Map.Entry<Integer, Long> entry : sharedClusterSizes.value().entrySet()) {
+                normalization_factors_temp.compute(entry.getKey(),
+                        (__, sum) -> (sum != null ? sum : 0) + Math.min(t, entry.getValue())
+                );
             }
 
-            float exactSilhSample = clusteringSample
-                    .value()
-                    .stream()
-                    .sequential()
+            // This is a patch added for the homework 3. Long values were null when transferred to
+            // workers if the they are not wrapped in Broadcast.
+            Broadcast<List<Broadcast<Long>>> normalization_factors = context.broadcast(
+                    normalization_factors_temp
+                            .values()
+                            .stream()
+                            .map(context::broadcast)
+                            .collect(Collectors.toList())
+            );
+
+            float approxSilhFull = currentClustering
                     .map(point -> G23HW3.clustering_silhouette_for_point(
                             clusteringSample.value(),
                             point._1,
                             point._2,
-                            cluster_sample_sizes)
+                            normalization_factors.value())
                     )
-                    .reduce(Float::sum)
-                    .orElse(0f) / clusteringSample.value().size();
+                    .reduce(Float::sum) / currentClustering.count();
 
-            long exact_sample_computation_time_ms = System.currentTimeMillis() - start_time_ms;
+            long approx_full_computation_time_ms = System.currentTimeMillis() - start_time_ms;
 
+            // ================================== Display results ==================================
             // Number of clusters k
             System.out.println("\n" + "Number of clusters k = " + k);
             // Silhouette coefficient
-            System.out.println("Silhouette coefficient = " + exactSilhSample);
+            System.out.println("Silhouette coefficient = " + approxSilhFull);
             // Time for clustering
             System.out.println("Time for clustering = " + clustering_time_ms);
             // Time for silhouette computation
-            System.out.println("Time for silhouette computation = " + exact_sample_computation_time_ms);
+            System.out.println("Time for silhouette computation = "
+                    + approx_full_computation_time_ms);
         }
-
-
-
     }
 }
